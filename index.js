@@ -3,12 +3,10 @@ const ms = require('ms');
 const express = require('express');
 const fs = require('fs');
 
-// Express voor Render
 const app = express();
 app.get('/', (req, res) => res.send('🦇 Batman Bot is alive!'));
-app.listen(3000, () => console.log('✅ Web server online'));
+app.listen(3000, () => console.log('✅ Web server running'));
 
-// ALLE benodigde intents toevoegen
 const client = new Client({ 
     intents: [
         GatewayIntentBits.Guilds,
@@ -19,248 +17,341 @@ const client = new Client({
     ] 
 });
 
-// CONFIGURATIE - VUL DIT IN MET JOUW ID's
+// ===== CONFIGURATION - ALL FROM ENVIRONMENT VARIABLES =====
 const CONFIG = {
     token: process.env.TOKEN,
     clientId: process.env.CLIENT_ID,
     guildId: process.env.GUILD_ID,
     premiumRoleId: process.env.PREMIUM_ROLE_ID,
     supportRoleId: process.env.SUPPORT_ROLE_ID,
-    ticketCategoryId: process.env.TICKET_CATEGORY_ID,      // Normale tickets categorie
-    premiumTicketCategoryId: process.env.PREMIUM_TICKET_CATEGORY_ID  // Premium tickets categorie
+    ticketCategoryId: process.env.TICKET_CATEGORY_ID,
+    premiumTicketCategoryId: process.env.PREMIUM_TICKET_CATEGORY_ID,
+    ownerRoleId: process.env.OWNER_ROLE_ID,  // Single owner role from env
+    ticketChannelId: process.env.TICKET_CHANNEL_ID  // Channel where /setup-ticket creates the panel
 };
 
 client.once('ready', async () => {
     console.log(`✅ ${client.user.tag} is online!`);
-    console.log(`🦇 Batman Ticket Bot is klaar!`);
+    console.log(`🦇 Batman bot is ready to go!`);
     
-    // Registreer slash commands
     const commands = [
         new SlashCommandBuilder()
             .setName('ticket')
-            .setDescription('🎫 Maak ticket panel aan'),
+            .setDescription('🎫 Create a ticket panel'),
         new SlashCommandBuilder()
             .setName('premium')
-            .setDescription('🦇 Geef premium (Admin only)')
-            .addUserOption(opt => opt.setName('user').setRequired(true).setDescription('Gebruiker'))
+            .setDescription('🦇 Give someone premium (Owners only)')
+            .addUserOption(opt => opt.setName('user').setRequired(true).setDescription('The user to give premium to'))
             .addStringOption(opt => opt.setName('length').setRequired(true).setDescription('1 day, 1 week, 1 month'))
-            .addStringOption(opt => opt.setName('reason').setRequired(false).setDescription('Reden')),
+            .addStringOption(opt => opt.setName('reason').setRequired(false).setDescription('Why are you giving premium?')),
+        new SlashCommandBuilder()
+            .setName('removepremium')
+            .setDescription('🦇 Remove premium from someone (Owners only)')
+            .addUserOption(opt => opt.setName('user').setRequired(true).setDescription('The user to remove premium from')),
         new SlashCommandBuilder()
             .setName('close')
-            .setDescription('🔒 Sluit ticket'),
+            .setDescription('🔒 Close this ticket'),
         new SlashCommandBuilder()
             .setName('setup-ticket')
-            .setDescription('📋 Zet ticket kanaal op (Admin only)')
+            .setDescription('📋 Setup the ticket system (Admin only)')
     ];
     
     const rest = new REST().setToken(CONFIG.token);
     try {
         await rest.put(Routes.applicationGuildCommands(CONFIG.clientId, CONFIG.guildId), { body: commands });
-        console.log('✅ Commands geregistreerd');
+        console.log('✅ Commands registered');
     } catch (error) {
-        console.error('Fout bij registreren commands:', error);
+        console.error('Error registering commands:', error);
     }
     
-    // Check elke minuut voor verlopen premium
-    setInterval(checkExpired, 60000);
+    setInterval(checkExpiredPremium, 60000);
 });
 
-// Check verlopen premium
-async function checkExpired() {
+// Check if someone is an owner
+function isOwner(member) {
+    return member.roles.cache.has(CONFIG.ownerRoleId);
+}
+
+// Check if someone has premium
+function hasPremium(member) {
+    return member.roles.cache.has(CONFIG.premiumRoleId);
+}
+
+// Check expired premium
+async function checkExpiredPremium() {
     const dataFile = './premium_data.json';
     if (!fs.existsSync(dataFile)) return;
     
     const data = JSON.parse(fs.readFileSync(dataFile));
     const now = Date.now();
-    const role = await client.guilds.cache.get(CONFIG.guildId)?.roles.fetch(CONFIG.premiumRoleId);
+    const premiumRole = await client.guilds.cache.get(CONFIG.guildId)?.roles.fetch(CONFIG.premiumRoleId);
     
-    for (const [userId, expire] of Object.entries(data)) {
-        if (now >= expire) {
+    for (const [userId, expireDate] of Object.entries(data)) {
+        if (now >= expireDate) {
             const member = await client.guilds.cache.get(CONFIG.guildId)?.members.fetch(userId).catch(() => null);
-            if (member && role) await member.roles.remove(role);
+            if (member && premiumRole && member.roles.cache.has(CONFIG.premiumRoleId)) {
+                await member.roles.remove(premiumRole);
+                console.log(`⏰ Premium expired for ${member.user.tag}`);
+                
+                try {
+                    const embed = new EmbedBuilder()
+                        .setColor(0xFF0000)
+                        .setTitle('🦇 Premium Expired')
+                        .setDescription(`Hey ${member.user.username}, your Batman premium just ran out.\n\nWant to renew? Just ask an owner!`)
+                        .setFooter({ text: 'Batman Trading' });
+                    await member.send({ embeds: [embed] });
+                } catch(e) {}
+            }
             delete data[userId];
             fs.writeFileSync(dataFile, JSON.stringify(data, null, 2));
-            console.log(`⏰ Premium verwijderd van ${member?.user?.tag || userId}`);
         }
     }
-}
-
-// Check of gebruiker premium heeft
-function hasPremium(member) {
-    return member.roles.cache.has(CONFIG.premiumRoleId);
 }
 
 client.on('interactionCreate', async interaction => {
     if (!interaction.isCommand()) return;
     
-    // === SETUP TICKET KANAAL (Admin only) ===
+    // ===== SETUP TICKET SYSTEM (Posts in the configured channel) =====
     if (interaction.commandName === 'setup-ticket') {
         if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-            return interaction.reply({ content: '❌ Alleen admins!', ephemeral: true });
+            return interaction.reply({ content: '❌ This is for admins only!', ephemeral: true });
+        }
+        
+        const targetChannel = client.channels.cache.get(CONFIG.ticketChannelId);
+        if (!targetChannel) {
+            return interaction.reply({ 
+                content: '❌ Ticket channel not found! Check your TICKET_CHANNEL_ID in environment variables.', 
+                ephemeral: true 
+            });
         }
         
         const embed = new EmbedBuilder()
             .setColor(0xFFD700)
-            .setTitle('🦇 BATMAN SUPPORT TICKETS 🦇')
-            .setDescription('Welkom bij het Batman Trading support systeem!\n\n**Hoe werkt het?**\n• Klik op de knop hieronder om een ticket te openen\n• Normale tickets gaan naar de normale categorie\n• **Premium leden** krijgen toegang tot **premium support** 🦇\n• Gebruik **/close** om het ticket te sluiten\n\n**Premium voordelen:**\n• Snellere response tijd\n• Prioriteit support\n• Eigen premium ticket categorie')
+            .setTitle('🦇 BATMAN SUPPORT')
+            .setDescription('Hey there! Need help? Just click a button below and we\'ll get back to you as soon as we can.')
             .addFields(
-                { name: '⏰ Normale response tijd', value: 'Binnen 30 minuten', inline: true },
-                { name: '⚡ Premium response tijd', value: 'Binnen 5 minuten', inline: true },
-                { name: '🦇 Support team', value: `<@&${CONFIG.supportRoleId}>`, inline: true }
+                { name: '📩 Regular Ticket', value: 'For general questions and help', inline: true },
+                { name: '👑 Premium Ticket', value: 'For our premium members', inline: true },
+                { name: '⏰ Response Time', value: 'We try to reply within 10-15 minutes!', inline: true }
             )
-            .setFooter({ text: 'Batman Trading • Support Systeem' })
+            .setFooter({ text: 'Batman Trading • We\'re here to help!' })
             .setTimestamp();
         
         const row = new ActionRowBuilder()
             .addComponents(
                 new ButtonBuilder()
                     .setCustomId('open_ticket')
-                    .setLabel('📩 Open Ticket')
-                    .setStyle(ButtonStyle.Primary)
-                    .setEmoji('🎫'),
+                    .setLabel('📩 Open a Ticket')
+                    .setStyle(ButtonStyle.Primary),
                 new ButtonBuilder()
                     .setCustomId('premium_ticket')
                     .setLabel('👑 Premium Ticket')
-                    .setStyle(ButtonStyle.Success)
-                    .setEmoji('🦇'),
+                    .setStyle(ButtonStyle.Success),
                 new ButtonBuilder()
                     .setCustomId('faq')
                     .setLabel('❓ FAQ')
                     .setStyle(ButtonStyle.Secondary)
-                    .setEmoji('📖')
             );
         
-        await interaction.reply({ embeds: [embed], components: [row] });
+        await targetChannel.send({ embeds: [embed], components: [row] });
+        await interaction.reply({ 
+            content: `✅ Ticket panel created in ${targetChannel}!`, 
+            ephemeral: true 
+        });
     }
     
-    // === PREMIUM COMMAND ===
+    // ===== PREMIUM COMMAND (OWNERS ONLY) =====
     if (interaction.commandName === 'premium') {
-        if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-            return interaction.reply({ content: '❌ Alleen admins kunnen dit commando gebruiken!', ephemeral: true });
-        }
-        
-        const user = interaction.options.getUser('user');
-        const length = interaction.options.getString('length');
-        const reason = interaction.options.getString('reason') || 'Geen reden opgegeven';
-        const duration = ms(length);
-        
-        if (!duration) {
+        // Check if user has the owner role
+        if (!isOwner(interaction.member)) {
             return interaction.reply({ 
-                content: '❌ Ongeldige duur! Gebruik bijv: `1 day`, `2 weeks`, `1 month`', 
+                content: '❌ Sorry, only server owners can give out premium. Talk to an owner if you need it!', 
                 ephemeral: true 
             });
         }
         
-        const member = await interaction.guild.members.fetch(user.id);
-        const role = interaction.guild.roles.cache.get(CONFIG.premiumRoleId);
+        const targetUser = interaction.options.getUser('user');
+        const length = interaction.options.getString('length');
+        const reason = interaction.options.getString('reason') || 'No reason given';
+        const duration = ms(length);
         
-        if (!role) {
-            return interaction.reply({ content: '❌ Premium rol niet gevonden! Check je configuratie.', ephemeral: true });
+        if (!duration) {
+            return interaction.reply({ 
+                content: '❌ Hmm, that doesn\'t look right. Try something like: `1 day`, `2 weeks`, or `1 month`', 
+                ephemeral: true 
+            });
         }
         
-        await member.roles.add(role);
+        const member = await interaction.guild.members.fetch(targetUser.id);
+        const premiumRole = interaction.guild.roles.cache.get(CONFIG.premiumRoleId);
         
-        // Opslaan voor expire
+        if (!premiumRole) {
+            return interaction.reply({ 
+                content: '❌ Uh oh! The premium role isn\'t set up yet. Check your config!', 
+                ephemeral: true 
+            });
+        }
+        
+        // Check if they already have premium
+        if (member.roles.cache.has(CONFIG.premiumRoleId)) {
+            return interaction.reply({ 
+                content: `❌ ${targetUser.username} already has premium! Use /removepremium first if you want to change it.`, 
+                ephemeral: true 
+            });
+        }
+        
+        await member.roles.add(premiumRole);
+        
         const expireDate = Date.now() + duration;
-        let data = {};
-        if (fs.existsSync('./premium_data.json')) data = JSON.parse(fs.readFileSync('./premium_data.json'));
-        data[user.id] = expireDate;
-        fs.writeFileSync('./premium_data.json', JSON.stringify(data, null, 2));
+        let premiumData = {};
+        if (fs.existsSync('./premium_data.json')) {
+            premiumData = JSON.parse(fs.readFileSync('./premium_data.json'));
+        }
+        premiumData[targetUser.id] = expireDate;
+        fs.writeFileSync('./premium_data.json', JSON.stringify(premiumData, null, 2));
         
-        // Embed met Batman logo
+        // Pretty embed for the channel
         const embed = new EmbedBuilder()
             .setColor(0xFFD700)
-            .setTitle('🦇 BATMAN PREMIUM 🦇')
-            .setDescription(`**${user.tag}** heeft nu premium ontvangen!`)
+            .setTitle('🦇 Premium Granted! 🦇')
+            .setDescription(`**${targetUser.username}** just got premium!`)
             .addFields(
-                { name: '📅 Duur', value: `\`${length}\``, inline: true },
-                { name: '⏰ Verloopt op', value: `<t:${Math.floor(expireDate/1000)}:F>`, inline: true },
-                { name: '⏱️ Nog te gaan', value: `<t:${Math.floor(expireDate/1000)}:R>`, inline: true },
-                { name: '📝 Reden', value: reason, inline: false },
-                { name: '👮 Toegekend door', value: interaction.user.tag, inline: true }
+                { name: '📅 Duration', value: length, inline: true },
+                { name: '⏰ Expires', value: `<t:${Math.floor(expireDate / 1000)}:F>`, inline: true },
+                { name: '📝 Reason', value: reason, inline: false },
+                { name: '👮 Given by', value: interaction.user.tag, inline: true }
             )
-            .setFooter({ text: 'Batman Trading • Premium Service' })
+            .setFooter({ text: 'Batman Trading' })
             .setTimestamp();
         
         await interaction.reply({ embeds: [embed] });
         
-        // Stuur DM naar gebruiker
+        // DM the user
         try {
             const dmEmbed = new EmbedBuilder()
                 .setColor(0xFFD700)
-                .setTitle('🦇 Batman Premium')
-                .setDescription(`Je hebt **${length}** premium gekregen in de Batman Trading server!`)
+                .setTitle('🦇 You got Premium!')
+                .setDescription(`Hey ${targetUser.username}! You just received premium in the Batman Trading server.`)
                 .addFields(
-                    { name: 'Verloopt op', value: `<t:${Math.floor(expireDate/1000)}:F>`, inline: true },
-                    { name: 'Premium voordeel', value: 'Je krijgt nu prioriteit support!', inline: true }
+                    { name: 'How long?', value: length, inline: true },
+                    { name: 'Expires', value: `<t:${Math.floor(expireDate / 1000)}:F>`, inline: true },
+                    { name: 'What now?', value: 'You can now use the premium ticket button for faster support!', inline: false }
                 )
-                .setFooter({ text: 'Batman Trading' });
-            await user.send({ embeds: [dmEmbed] });
+                .setFooter({ text: 'Thanks for being part of Batman Trading!' });
+            await targetUser.send({ embeds: [dmEmbed] });
         } catch(e) {
-            console.log('Kon geen DM sturen');
+            console.log('Could not DM user');
         }
     }
     
-    // === TICKET PANEL COMMAND (oude manier, werkt ook) ===
+    // ===== REMOVE PREMIUM COMMAND (OWNERS ONLY) =====
+    if (interaction.commandName === 'removepremium') {
+        if (!isOwner(interaction.member)) {
+            return interaction.reply({ 
+                content: '❌ Sorry, only server owners can remove premium.', 
+                ephemeral: true 
+            });
+        }
+        
+        const targetUser = interaction.options.getUser('user');
+        const member = await interaction.guild.members.fetch(targetUser.id);
+        const premiumRole = interaction.guild.roles.cache.get(CONFIG.premiumRoleId);
+        
+        if (!member.roles.cache.has(CONFIG.premiumRoleId)) {
+            return interaction.reply({ 
+                content: `❌ ${targetUser.username} doesn't have premium right now.`, 
+                ephemeral: true 
+            });
+        }
+        
+        await member.roles.remove(premiumRole);
+        
+        // Remove from expiry data
+        if (fs.existsSync('./premium_data.json')) {
+            let premiumData = JSON.parse(fs.readFileSync('./premium_data.json'));
+            delete premiumData[targetUser.id];
+            fs.writeFileSync('./premium_data.json', JSON.stringify(premiumData, null, 2));
+        }
+        
+        const embed = new EmbedBuilder()
+            .setColor(0xFFA500)
+            .setTitle('🦇 Premium Removed')
+            .setDescription(`${targetUser.username} no longer has premium.`)
+            .addFields(
+                { name: 'Removed by', value: interaction.user.tag, inline: true },
+                { name: 'Removed on', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
+            )
+            .setFooter({ text: 'Batman Trading' });
+        
+        await interaction.reply({ embeds: [embed] });
+        
+        try {
+            await targetUser.send(`🦇 Hey ${targetUser.username}, your Batman premium has been removed. Talk to an owner if you have questions!`);
+        } catch(e) {}
+    }
+    
+    // ===== TICKET PANEL COMMAND (Legacy - still works) =====
     if (interaction.commandName === 'ticket') {
         const embed = new EmbedBuilder()
             .setColor(0xFFD700)
-            .setTitle('🎫 BATMAN SUPPORT')
-            .setDescription('Klik op een knop om een ticket te openen')
+            .setTitle('🎫 Open a Ticket')
+            .setDescription('Click a button below to get help!')
             .addFields(
-                { name: '📩 Normaal Ticket', value: 'Voor algemene support', inline: true },
-                { name: '👑 Premium Ticket', value: 'Alleen voor premium leden', inline: true }
+                { name: 'Regular Ticket', value: 'For everyone', inline: true },
+                { name: 'Premium Ticket', value: 'Only for premium members', inline: true }
             );
         
         const row = new ActionRowBuilder()
             .addComponents(
-                new ButtonBuilder().setCustomId('open_ticket').setLabel('📩 Normaal Ticket').setStyle(ButtonStyle.Primary),
+                new ButtonBuilder().setCustomId('open_ticket').setLabel('📩 Regular Ticket').setStyle(ButtonStyle.Primary),
                 new ButtonBuilder().setCustomId('premium_ticket').setLabel('👑 Premium Ticket').setStyle(ButtonStyle.Success)
             );
         
         await interaction.reply({ embeds: [embed], components: [row] });
     }
     
-    // === CLOSE COMMAND ===
+    // ===== CLOSE COMMAND =====
     if (interaction.commandName === 'close') {
         if (!interaction.channel.name.startsWith('ticket-') && !interaction.channel.name.startsWith('premium-')) {
-            return interaction.reply({ content: '❌ Dit commando kan alleen in een ticket kanaal gebruikt worden!', ephemeral: true });
+            return interaction.reply({ 
+                content: '❌ This command only works in ticket channels!', 
+                ephemeral: true 
+            });
         }
         
-        const closeEmbed = new EmbedBuilder()
+        const embed = new EmbedBuilder()
             .setColor(0xFF0000)
-            .setTitle('🔒 Ticket wordt gesloten')
-            .setDescription('Dit ticket wordt over **5 seconden** gesloten.\nBedankt voor het gebruiken van Batman Support!')
-            .setFooter({ text: 'Batman Trading' });
+            .setTitle('🔒 Closing Ticket')
+            .setDescription('This ticket will close in **5 seconds**.\n\nThanks for reaching out!');
         
-        await interaction.reply({ embeds: [closeEmbed] });
+        await interaction.reply({ embeds: [embed] });
         setTimeout(() => interaction.channel.delete(), 5000);
     }
 });
 
-// Knop interacties
+// ===== BUTTON HANDLERS =====
 client.on('interactionCreate', async interaction => {
     if (!interaction.isButton()) return;
     
-    // Normaal ticket openen
+    // Regular ticket
     if (interaction.customId === 'open_ticket') {
         const hasPremiumRole = hasPremium(interaction.member);
         const categoryId = hasPremiumRole ? CONFIG.premiumTicketCategoryId : CONFIG.ticketCategoryId;
         const prefix = hasPremiumRole ? 'premium' : 'ticket';
         
-        // Check of gebruiker al een open ticket heeft
+        // Check for existing ticket
         const existingTicket = interaction.guild.channels.cache.find(
             channel => channel.name === `${prefix}-${interaction.user.username}` && channel.parentId === categoryId
         );
         
         if (existingTicket) {
             return interaction.reply({ 
-                content: `❌ Je hebt al een open ticket! Ga naar ${existingTicket}`, 
+                content: `❌ You already have a ticket open! Check ${existingTicket}`, 
                 ephemeral: true 
             });
         }
         
-        // Maak ticket aan
+        // Create the ticket
         const ticketChannel = await interaction.guild.channels.create({
             name: `${prefix}-${interaction.user.username}`,
             type: ChannelType.GuildText,
@@ -272,72 +363,66 @@ client.on('interactionCreate', async interaction => {
             ]
         });
         
-        // Embed voor in het ticket
-        const ticketEmbed = new EmbedBuilder()
-            .setColor(hasPremiumRole ? 0xFFD700 : 0x00FF00)
-            .setTitle(hasPremiumRole ? '👑 BATMAN PREMIUM SUPPORT 👑' : '🦇 BATMAN SUPPORT TICKET 🦇')
-            .setDescription(`Welkom ${interaction.user},\n\nEen support medewerker zal je zo snel mogelijk helpen!`)
+        const embed = new EmbedBuilder()
+            .setColor(hasPremiumRole ? 0xFFD700 : 0x00AAFF)
+            .setTitle(hasPremiumRole ? '👑 Premium Support' : '🦇 Support Ticket')
+            .setDescription(`Hey ${interaction.user}! Thanks for reaching out.\n\nA staff member will be with you shortly. In the meantime, feel free to explain what you need help with!`)
             .addFields(
-                { name: '📌 Ticket Type', value: hasPremiumRole ? 'Premium Support' : 'Normale Support', inline: true },
-                { name: '👤 Aangemaakt door', value: interaction.user.tag, inline: true },
-                { name: '📅 Datum', value: `<t:${Math.floor(Date.now()/1000)}:F>`, inline: true },
-                { name: '⚡ Response tijd', value: hasPremiumRole ? 'Binnen 5 minuten' : 'Binnen 30 minuten', inline: true },
-                { name: '💡 Instructies', value: '• Leg je vraag uit\n• Wees geduldig\n• Gebruik **/close** om te sluiten', inline: false }
+                { name: '📌 Ticket', value: `Created for ${interaction.user.tag}`, inline: true },
+                { name: '💡 Tip', value: 'Use **/close** when we\'re done!', inline: true }
             )
-            .setFooter({ text: 'Batman Trading • Support', iconURL: 'https://i.imgur.com/YourBatmanImage.png' })
+            .setFooter({ text: 'Batman Trading • We got your back!' })
             .setTimestamp();
         
         const row = new ActionRowBuilder()
             .addComponents(
                 new ButtonBuilder()
                     .setCustomId('close_ticket')
-                    .setLabel('🔒 Sluit Ticket')
-                    .setStyle(ButtonStyle.Danger)
-                    .setEmoji('🔒'),
+                    .setLabel('🔒 Close Ticket')
+                    .setStyle(ButtonStyle.Danger),
                 new ButtonBuilder()
                     .setCustomId('claim_ticket')
                     .setLabel('📋 Claim Ticket')
                     .setStyle(ButtonStyle.Success)
-                    .setEmoji('✅')
             );
         
         await ticketChannel.send({ 
             content: `<@${interaction.user.id}> <@&${CONFIG.supportRoleId}>`, 
-            embeds: [ticketEmbed], 
+            embeds: [embed], 
             components: [row] 
         });
         
         await interaction.reply({ 
-            content: `✅ ${hasPremiumRole ? 'Premium' : ''} Ticket succesvol aangemaakt! Ga naar ${ticketChannel}`, 
+            content: `✅ Ticket created! Head over to ${ticketChannel}`, 
             ephemeral: true 
         });
     }
     
-    // Premium ticket knop (alleen voor premium leden)
+    // Premium ticket button
     if (interaction.customId === 'premium_ticket') {
         if (!hasPremium(interaction.member)) {
-            const noPremiumEmbed = new EmbedBuilder()
+            const embed = new EmbedBuilder()
                 .setColor(0xFF0000)
-                .setTitle('❌ Geen Premium Access')
-                .setDescription('Deze knop is alleen voor premium leden!\n\nKoop premium via een admin om toegang te krijgen tot:\n• Snellere support\n• Prioriteit behandeling\n• Eigen premium categorie')
+                .setTitle('❌ Premium Only')
+                .setDescription('This button is only for premium members!\n\nWant premium? Talk to an owner about getting it.')
                 .setFooter({ text: 'Batman Trading' });
             
-            return interaction.reply({ embeds: [noPremiumEmbed], ephemeral: true });
+            return interaction.reply({ embeds: [embed], ephemeral: true });
         }
         
-        // Check of gebruiker al een premium ticket heeft
+        // Check for existing premium ticket
         const existingTicket = interaction.guild.channels.cache.find(
             channel => channel.name === `premium-${interaction.user.username}` && channel.parentId === CONFIG.premiumTicketCategoryId
         );
         
         if (existingTicket) {
             return interaction.reply({ 
-                content: `❌ Je hebt al een premium ticket! Ga naar ${existingTicket}`, 
+                content: `❌ You already have a premium ticket open! Check ${existingTicket}`, 
                 ephemeral: true 
             });
         }
         
-        // Maak premium ticket aan
+        // Create premium ticket
         const ticketChannel = await interaction.guild.channels.create({
             name: `premium-${interaction.user.username}`,
             type: ChannelType.GuildText,
@@ -349,108 +434,105 @@ client.on('interactionCreate', async interaction => {
             ]
         });
         
-        const premiumEmbed = new EmbedBuilder()
+        const embed = new EmbedBuilder()
             .setColor(0xFFD700)
-            .setTitle('👑 BATMAN PREMIUM SUPPORT 👑')
-            .setDescription(`Welkom ${interaction.user} bij de premium support!\n\nJe krijgt **prioriteit behandeling** door ons team.`)
+            .setTitle('👑 Premium Support Ticket')
+            .setDescription(`Hey ${interaction.user}! Thanks for being a premium member.\n\nWe'll get back to you as soon as we can. Premium members usually get a faster response!`)
             .addFields(
-                { name: '⚡ Premium Service', value: 'Response tijd: **Binnen 5 minuten**', inline: true },
-                { name: '👤 Aangemaakt door', value: interaction.user.tag, inline: true },
-                { name: '🦇 Speciale behandeling', value: 'Je staat vooraan in de wachtrij!', inline: true }
+                { name: '📌 Premium Member', value: interaction.user.tag, inline: true },
+                { name: '💡 Note', value: 'Just explain your issue and we\'ll help you out!', inline: true }
             )
-            .setFooter({ text: 'Batman Trading • Premium Support' })
+            .setFooter({ text: 'Batman Trading • Thanks for supporting us!' })
             .setTimestamp();
         
         const row = new ActionRowBuilder()
             .addComponents(
                 new ButtonBuilder()
                     .setCustomId('close_ticket')
-                    .setLabel('🔒 Sluit Ticket')
-                    .setStyle(ButtonStyle.Danger)
-                    .setEmoji('🔒'),
+                    .setLabel('🔒 Close Ticket')
+                    .setStyle(ButtonStyle.Danger),
                 new ButtonBuilder()
                     .setCustomId('claim_ticket')
                     .setLabel('📋 Claim Ticket')
                     .setStyle(ButtonStyle.Success)
-                    .setEmoji('✅')
             );
         
         await ticketChannel.send({ 
-            content: `<@${interaction.user.id}> <@&${CONFIG.supportRoleId}> **⚡ PREMIUM TICKET - PRIORITEIT ⚡**`, 
-            embeds: [premiumEmbed], 
+            content: `<@${interaction.user.id}> <@&${CONFIG.supportRoleId}> 👑 **PREMIUM TICKET** 👑`, 
+            embeds: [embed], 
             components: [row] 
         });
         
         await interaction.reply({ 
-            content: `✅ Premium ticket aangemaakt! Ga naar ${ticketChannel}`, 
+            content: `✅ Premium ticket created! Go to ${ticketChannel}`, 
             ephemeral: true 
         });
     }
     
-    // Sluit ticket knop
+    // Close button
     if (interaction.customId === 'close_ticket') {
-        const closeEmbed = new EmbedBuilder()
+        const embed = new EmbedBuilder()
             .setColor(0xFF0000)
-            .setTitle('🔒 Ticket Sluiten')
-            .setDescription('Weet je zeker dat je dit ticket wilt sluiten?\nKlik op **Bevestig** om te sluiten.')
+            .setTitle('🔒 Close this ticket?')
+            .setDescription('Click **Confirm** to close this ticket.\nClick **Cancel** to keep it open.')
             .setFooter({ text: 'Batman Trading' });
         
         const row = new ActionRowBuilder()
             .addComponents(
                 new ButtonBuilder()
                     .setCustomId('confirm_close')
-                    .setLabel('✅ Bevestig')
+                    .setLabel('✅ Confirm')
                     .setStyle(ButtonStyle.Danger),
                 new ButtonBuilder()
                     .setCustomId('cancel_close')
-                    .setLabel('❌ Annuleer')
+                    .setLabel('❌ Cancel')
                     .setStyle(ButtonStyle.Secondary)
             );
         
-        await interaction.reply({ embeds: [closeEmbed], components: [row], ephemeral: true });
+        await interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
     }
     
-    // Bevestig sluiten
+    // Confirm close
     if (interaction.customId === 'confirm_close') {
-        await interaction.reply({ content: '🔒 Ticket wordt over 5 seconden gesloten...', ephemeral: true });
+        await interaction.reply({ content: '🔒 Closing in 5 seconds...', ephemeral: true });
         setTimeout(() => interaction.channel.delete(), 5000);
     }
     
-    // Annuleer sluiten
+    // Cancel close
     if (interaction.customId === 'cancel_close') {
-        await interaction.update({ content: '❌ Sluiten geannuleerd!', embeds: [], components: [] });
+        await interaction.update({ content: '❌ Close cancelled!', embeds: [], components: [] });
     }
     
     // Claim ticket
     if (interaction.customId === 'claim_ticket') {
         if (!interaction.member.roles.cache.has(CONFIG.supportRoleId)) {
-            return interaction.reply({ content: '❌ Alleen support team kan tickets claimen!', ephemeral: true });
+            return interaction.reply({ content: '❌ Only support team can claim tickets!', ephemeral: true });
         }
         
-        const claimEmbed = new EmbedBuilder()
+        const embed = new EmbedBuilder()
             .setColor(0x00FF00)
-            .setTitle('✅ Ticket Geclaimed')
-            .setDescription(`${interaction.user} heeft dit ticket geclaimed en zal je helpen!`)
+            .setTitle('✅ Ticket Claimed')
+            .setDescription(`${interaction.user} is now helping you out! They'll reply as soon as they can.`)
             .setFooter({ text: 'Batman Trading' });
         
-        await interaction.reply({ embeds: [claimEmbed] });
+        await interaction.reply({ embeds: [embed] });
     }
     
-    // FAQ knop
+    // FAQ button
     if (interaction.customId === 'faq') {
-        const faqEmbed = new EmbedBuilder()
+        const embed = new EmbedBuilder()
             .setColor(0xFFD700)
-            .setTitle('📖 Veelgestelde Vragen')
-            .setDescription('Hier zijn de meest gestelde vragen:')
+            .setTitle('📖 Frequently Asked Questions')
+            .setDescription('Here are some common questions:')
             .addFields(
-                { name: '🦇 Hoe krijg ik premium?', value: 'Neem contact op met een admin via een ticket!', inline: false },
-                { name: '⚡ Wat zijn premium voordelen?', value: 'Snellere support (binnen 5 min) en prioriteit behandeling!', inline: false },
-                { name: '❓ Hoe lang duurt normale support?', value: 'Meestal binnen 30 minuten.', inline: false },
-                { name: '🔒 Hoe sluit ik mijn ticket?', value: 'Gebruik **/close** in het ticket kanaal.', inline: false }
+                { name: '🦇 How do I get premium?', value: 'Talk to an owner! They\'re the only ones who can give it out.', inline: false },
+                { name: '⏰ How long until someone replies?', value: 'We try to reply within 10-15 minutes. Premium members usually get a faster response!', inline: false },
+                { name: '🔒 How do I close my ticket?', value: 'Just type `/close` in this channel, or click the close button!', inline: false },
+                { name: '📝 What can I use tickets for?', value: 'Questions, reports, appeals, or just saying hi!', inline: false }
             )
-            .setFooter({ text: 'Batman Trading' });
+            .setFooter({ text: 'Batman Trading • Got more questions? Just open a ticket!' });
         
-        await interaction.reply({ embeds: [faqEmbed], ephemeral: true });
+        await interaction.reply({ embeds: [embed], ephemeral: true });
     }
 });
 
